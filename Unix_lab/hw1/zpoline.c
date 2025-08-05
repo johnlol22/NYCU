@@ -12,6 +12,7 @@
 #include <dlfcn.h>
 #include <assert.h>
 #include <linux/sched.h>  /* For __NR_clone and CLONE_VM */
+#include <capstone/capstone.h>
 
 #define SYSCALL_OPCODE_0 0x0F
 #define SYSCALL_OPCODE_1 0x05
@@ -40,7 +41,7 @@ extern void asm_syscall_hook(void);
 extern void syscall_addr(void);
 
 // Function pointer for the hook function
-static syscall_hook_fn_t hook_fn = NULL;
+static syscall_hook_fn_t hook_fn = trigger_syscall;
 
 
 // Define the raw assembly function for trigger_syscall and syscall_hook
@@ -48,13 +49,15 @@ void __raw_asm() {
     asm volatile(
         ".globl trigger_syscall \n"
         "trigger_syscall: \n"
-        "  movq %rdi, %rax \n"    // syscall number
-        "  movq %rsi, %rdi \n"    // arg1
-        "  movq %rdx, %rsi \n"    // arg2
-        "  movq %rcx, %rdx \n"    // arg3
-        "  movq %r8, %r10  \n"    // arg4 (Linux uses r10, not rcx)
-        "  movq %r9, %r8   \n"    // arg5
-        "  movq 8(%rsp), %r9 \n"  // arg6 (from stack)
+        // "  movq %rdi, %rax \n"    // syscall number
+        // "  movq %rsi, %rdi \n"    // arg1
+        // "  movq %rdx, %rsi \n"    // arg2
+        // "  movq %rcx, %rdx \n"    // arg3
+        // "  movq %r8, %r10  \n"    // arg4 (Linux uses r10, not rcx)
+        // "  movq %r9, %r8   \n"    // arg5
+        // "  movq 8(%rsp), %r9 \n"  // arg6 (from stack)
+	    "  movq %rcx, %r10    \n"
+	    "  movq 8(%rsp), %rax \n"
         ".globl syscall_addr \n"
         "syscall_addr: \n"
         "  syscall \n"
@@ -66,48 +69,56 @@ void __raw_asm() {
     asm volatile(
         ".globl asm_syscall_hook \n"
         "asm_syscall_hook: \n"
-        "cmpq $15, %rax \n"       // rt_sigreturn
-        "je do_rt_sigreturn \n"
-        "pushq %rbp \n"
-        "movq %rsp, %rbp \n"
+        //"  cmpq $0x3a, %rax \n"       // Check if syscall is vfork (58)
+        //"  jne asm_start \n"          // If not, proceed with normal processing
+        //"  addq $128, %rsp \n"
+        //"  popq %rsi \n"              // Pop return address into rsi
+        //"  andq $-16, %rsp \n"        // 16 byte stack alignment
+        //"  syscall \n"                // Execute vfork directly
+        //"  pushq %rsi \n"             // Push return address back
+        //"  ret \n"                    // Return to caller
+            
+        "asm_start: \n"
+        "  cmpq $15, %rax \n"         // rt_sigreturn
+        "  je do_rt_sigreturn \n"
+        "  pushq %rbp \n"
+        "  movq %rsp, %rbp \n"
 
-        // 16 byte stack alignment for function calls
-        "andq $-16, %rsp \n"
-        
-        // Save all registers
-        "pushq %r11 \n"
-        "pushq %r9 \n"
-        "pushq %r8 \n"
-        "pushq %rdi \n"
-        "pushq %rsi \n"
-        "pushq %rdx \n"
-        "pushq %rcx \n"
-        
-        // Arguments for syscall_hook
-        "pushq 136(%rbp) \n"      // return address
-        "pushq %rax \n"          // syscall number
-        "pushq %r10 \n"          // 4th arg for syscall
-        
-        "callq syscall_hook@plt \n"
-        
-        "popq %r10 \n"
-        "addq $16, %rsp \n"       // discard arg7 and arg8
-        
-        "popq %rcx \n"
-        "popq %rdx \n"
-        "popq %rsi \n"
-        "popq %rdi \n"
-        "popq %r8 \n"
-        "popq %r9 \n"
-        "popq %r11 \n"
-        
-        "leaveq \n"
-        "addq $128, %rsp \n"
-        "retq \n"
-        
+        "  andq $-16, %rsp \n"        // 16 byte stack alignment
+                
+        "  pushq %r11 \n"
+        "  pushq %r9 \n"
+        "  pushq %r8 \n"
+        "  pushq %rdi \n"
+        "  pushq %rsi \n"
+        "  pushq %rdx \n"
+        "  pushq %rcx \n" 
+                
+        "  pushq 136(%rbp) \n"         // return address - CORRECTED
+        "  pushq %rax \n"            // syscall number
+        "  pushq %r10 \n"            // 4th arg for syscall
+                
+        "  callq syscall_hook@plt \n"
+                
+        //"  addq $8, %rsp \n"         // discard the other arguments
+        "  popq %r10 \n"
+        "  addq $16, %rsp \n"         // discard the other arguments
+                
+        "  popq %rcx \n"
+        "  popq %rdx \n"
+        "  popq %rsi \n"
+        "  popq %rdi \n"
+        "  popq %r8 \n"
+        "  popq %r9 \n"
+        "  popq %r11 \n"
+                
+        "  leaveq \n"                 // Restore %rbp and %rsp
+        "  addq $128, %rsp \n\t"
+        "  ret \n"                    // Return to caller
+                
         "do_rt_sigreturn: \n"
-        "addq $136, %rsp \n"
-        "jmp syscall_addr \n"
+        "  addq $136, %rsp \n"          // Skip only the return address
+        "  jmp syscall_addr \n"
     );
 }
 
@@ -121,36 +132,34 @@ int64_t syscall_hook(int64_t rdi, int64_t rsi,
                      int64_t retptr)
 {
     
-    // Handle clone3 syscall
-    if (rax_on_stack == 435 /* __NR_clone3 */) {
-        uint64_t *ca = (uint64_t *) rdi; /* struct clone_args */
-        if (ca[0] /* flags */ & CLONE_VM) {
-            // Make sure we can safely access the stack pointer
-            if (ca[5] != 0 && ca[6] > sizeof(uint64_t)) {
-                ca[6] /* stack_size */ -= sizeof(uint64_t);
-                *((uint64_t *) (ca[5] /* stack */ + ca[6] /* stack_size */)) = retptr;
-            }
+    if (rax_on_stack == 435 /* __NR_clone3 */)
+    {
+        uint64_t *ca = (uint64_t *)rdi; /* struct clone_args */
+        if (ca[0] /* flags */ & CLONE_VM)
+        {
+            ca[6] /* stack_size */ -= sizeof(uint64_t);
+            *((uint64_t *)(ca[5] /* stack */ + ca[6] /* stack_size */)) = retptr;
         }
     }
-    
-    // Handle clone syscall 
-    if (rax_on_stack == __NR_clone) {
-        if (rdi & CLONE_VM) { // pthread creation
-            // Make sure stack pointer is valid before modifying
-            if (rsi != 0) {
-                rsi -= sizeof(uint64_t);
-                *((uint64_t *) rsi) = retptr;
-            }
+
+    if (rax_on_stack == __NR_clone)
+    {
+        if (rdi & CLONE_VM)
+        { // pthread creation
+            /* push return address to the stack */
+            rsi -= sizeof(uint64_t);
+            *((uint64_t *)rsi) = retptr;
         }
-    }
+    } 
     
     // Call the hook function from the loaded library
-    if (hook_fn) {
-        return hook_fn(rdi, rsi, rdx, r10_on_stack, r8, r9, rax_on_stack);
-    }
+    // if (hook_fn) {
+    //     return hook_fn(rdi, rsi, rdx, r10_on_stack, r8, r9, rax_on_stack);
+    // }
     
     // Fallback if hook isn't loaded - use trigger_syscall directly
-    return trigger_syscall(rax_on_stack, rdi, rsi, rdx, r10_on_stack, r8, r9);
+    // return trigger_syscall(rax_on_stack, rdi, rsi, rdx, r10_on_stack, r8, r9);
+    return hook_fn(rdi, rsi, rdx, r10_on_stack, r8, r9, rax_on_stack);
 }
 
 // Set up the trampoline at address 0
@@ -165,7 +174,10 @@ void setup_trampoline() {
     }
     
     // Fill with NOPs
-    memset(mem, 0x90, 0x1000);
+    // memset(mem, 0x90, 0x1000);
+    int i;
+	for (i = 0; i < 512; i++)
+		((uint8_t *) mem)[i] = 0x90;
     
     // Get address of the syscall hook
     void *hook_addr = (void*)asm_syscall_hook;
@@ -197,129 +209,342 @@ void setup_trampoline() {
     mprotect(mem, 0x1000, PROT_EXEC);
 }
 
-// Find and replace syscall instructions
-void rewrite_syscalls() {
-    
-    FILE *maps = fopen("/proc/self/maps", "r");
-    if (!maps) {
-        fprintf(stderr, "Failed to open /proc/self/maps\n");
-        exit(1);
-    }
-    
-    char line[1024];
-    while (fgets(line, sizeof(line), maps)) {
-        // Skip special regions
-        if (strstr(line, "[stack]") || 
-            strstr(line, "[vdso]")) {
-            continue;
-        }
-        
-        // Parse address range and permissions
-        uintptr_t start, end;
-        char perms[5] = {0};
-        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) {
-            continue;
-        }
-        
-        // Only process executable regions
-        if (strchr(perms, 'x') == NULL) {
-            continue;
-        }
-        
-        // Skip regions at address 0 (our trampoline)
-        if (start < 0x1000) {
-            continue;
-        }
-        
-        // Make the region writable
-        int orig_prot = 0;
-        if (strchr(perms, 'r')) orig_prot |= PROT_READ;
-        if (strchr(perms, 'w')) orig_prot |= PROT_WRITE;
-        if (strchr(perms, 'x')) orig_prot |= PROT_EXEC;
-        
-        if (mprotect((void*)start, end - start, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-            continue;
-        }
-        
-        // In the rewrite_syscalls function, add AVX detection:
-        for (uintptr_t addr = start; addr < end - 1; addr++) {
-            unsigned char *ptr = (unsigned char*)addr;
-
-            // Skip syscall instruction in trigger_syscall
-            if ((uintptr_t)ptr == (uintptr_t)syscall_addr) {
-                continue;
-            }
-
-
-            if (ptr[0] == 0x0F && ptr[1] == 0x05) {  // syscall
-                ptr[0] = 0xff;  // call
-                ptr[1] = 0xd0;  // *%rax
-            }
-        }
-        
-        // Restore original permissions
-        mprotect((void*)start, end - start, orig_prot);
-    }
-    
-    fclose(maps);
-}
-
-
-void selective_rewrite() {
-    // Only rewrite specific libc functions
-    void *libc = dlopen("libc.so.6", RTLD_LAZY);
-    if (!libc) {
-        DEBUG("Failed to load libc.so.6");
+// void rewrite_region_with_disasm(csh handle, uintptr_t start, uintptr_t end) {
+//     uint8_t *code = (uint8_t*)start;
+//     size_t code_size = end - start;
+//     uint64_t address = start;
+//     
+//     cs_insn *insn;
+//     size_t count = cs_disasm(handle, code, code_size, address, 0, &insn);
+//     
+//     if (count > 0) {
+//         for (size_t i = 0; i < count; i++) {
+//             // Check if this instruction is 'syscall'
+//             if (insn[i].id == X86_INS_SYSCALL) {
+//                 
+//                 // Skip syscall instruction in trigger_syscall
+//                 if (insn[i].address == (uint64_t)syscall_addr) {
+//                     continue;
+//                 }
+//                 
+//                 // Verify it's exactly 2 bytes (0x0F 0x05)
+//                 if (insn[i].size == 2) {
+//                     uint8_t *patch_addr = (uint8_t*)insn[i].address;
+//                     
+//                     // DEBUG("Patching syscall at 0x%lx", insn[i].address);
+//                     
+//                     // Replace with 'call *%rax' (0xFF 0xD0)
+//                     patch_addr[0] = 0xFF;
+//                     patch_addr[1] = 0xD0;
+//                 } else {
+//                     DEBUG("Warning: syscall instruction has unexpected size %d at 0x%lx", 
+//                           insn[i].size, insn[i].address);
+//                 }
+//             }
+//         }
+//         cs_free(insn, count);
+//     }
+// }
+// 
+// void rewrite_syscalls() {
+//     FILE *maps = fopen("/proc/self/maps", "r");
+//     if (!maps) {
+//         fprintf(stderr, "Failed to open /proc/self/maps\n");
+//         exit(1);
+//     }
+//     
+//     // Initialize Capstone disassembler
+//     csh handle;
+//     if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) {
+//         fprintf(stderr, "Failed to initialize disassembler\n");
+//         exit(1);
+//     }
+//     
+//     char line[1024];
+//     while (fgets(line, sizeof(line), maps)) {
+//         // Skip special regions
+//         if (strstr(line, "[stack]") || strstr(line, "[vsyscall]") || 
+//             strstr(line, "[vdso]")) {
+//             continue;
+//         }
+//         
+//         // Parse address range and permissions
+//         uintptr_t start, end;
+//         char perms[5] = {0};
+//         if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) {
+//             continue;
+//         }
+//         
+//         // Only process executable regions
+//         if (strchr(perms, 'x') == NULL) {
+//             continue;
+//         }
+//         
+//         // Skip regions at address 0 (our trampoline)
+//         if (start < 0x1000) {
+//             continue;
+//         }
+//         
+//         // Make the region writable
+//         int orig_prot = 0;
+//         if (strchr(perms, 'r')) orig_prot |= PROT_READ;
+//         if (strchr(perms, 'w')) orig_prot |= PROT_WRITE;
+//         if (strchr(perms, 'x')) orig_prot |= PROT_EXEC;
+//         
+//         if (mprotect((void*)start, end - start, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+//             continue;
+//         }
+//         
+//         // Disassemble and patch safely
+//         rewrite_region_with_disasm(handle, start, end);
+//         
+//         // Restore original permissions
+//         mprotect((void*)start, end - start, orig_prot);
+//     }
+//     
+//     cs_close(&handle);
+//     fclose(maps);
+// }
+// Rewrite a buffer of code using Capstone
+void disassemble_and_rewrite_capstone(uint8_t *code, size_t code_size, int mem_prot)
+{
+    // 1. Make the memory region writable
+    if (mprotect((void *)code, code_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+    {
+        perror("mprotect RWX");
         return;
     }
-    
-    // Find addresses of syscall wrappers
-    struct func_to_patch {
-        const char *name;
-        void *addr;
-    } funcs[] = {
-        {"open", NULL},
-        {"openat", NULL},
-        {"read", NULL},
-        {"write", NULL},
-        {"connect", NULL},
-        {"execve", NULL},
-        {NULL, NULL}
-    };
-    
-    // Find function addresses
-    for (int i = 0; funcs[i].name != NULL; i++) {
-        funcs[i].addr = dlsym(libc, funcs[i].name);
-        // if (funcs[i].addr) {
-        //     DEBUG("Found %s at %p", funcs[i].name, funcs[i].addr);
-        // }
+
+    // 2. Initialize Capstone
+    csh handle;
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK)
+    {
+        fprintf(stderr, "Failed to initialize Capstone\n");
+        goto restore_prot;
     }
-    
-    // Patch each function
-    for (int i = 0; funcs[i].name != NULL; i++) {
-        if (!funcs[i].addr) continue;
-        
-        // Make memory writable
-        uintptr_t page_start = ((uintptr_t)funcs[i].addr) & ~0xFFF;
-        mprotect((void*)page_start, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
-        
-        // Find syscall instruction (limited scan)
-        unsigned char *func = (unsigned char*)funcs[i].addr;
-        for (int j = 0; j < 128; j++) {
-            if (func[j] == 0x0F && func[j+1] == 0x05) {  // syscall
-                // DEBUG("Patching syscall in %s at offset %d", funcs[i].name, j);
-                func[j] = 0xFF;  // call
-                func[j+1] = 0xD0;  // *%rax
-                break;
+    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+    // enable skip-data so Capstone keeps going past non-code bytes
+    cs_option(handle, CS_OPT_SKIPDATA, CS_OPT_ON);
+
+    // 3. Disassemble the code region
+    cs_insn *insn = NULL;
+    size_t count = cs_disasm(handle, code, code_size, (uint64_t)code, 0, &insn);
+    if (count == 0)
+    {
+        fprintf(stderr, "Capstone failed to disassemble code\n");
+        goto cleanup;
+    }
+
+    // 4. Iterate over each instruction
+    for (size_t i = 0; i < count; i++)
+    {
+        cs_insn *ci = &insn[i];
+        cs_detail *detail = ci->detail;
+        uint8_t *ptr = (uint8_t *)ci->address;
+
+        // invalid instruction, e.g. data
+        if (ci->id == 0 || ci->detail == NULL)
+        {
+            continue;
+        }
+
+        // 4a. Adjust stack-offset memory accesses
+        if (detail && detail->x86.op_count > 0)
+        {
+            for (int op_i = 0; op_i < detail->x86.op_count; op_i++)
+            {
+                cs_x86_op *op = &detail->x86.operands[op_i];
+                if (op->type == X86_OP_MEM && op->mem.base == X86_REG_RSP)
+                {
+                    int64_t disp = op->mem.disp;
+                    if (disp >= -0x78 && disp < 0)
+                    {
+                        uint8_t off = (uint8_t)disp;
+                        // Search nearby bytes for pattern 0x24, off
+                        for (size_t j = 0; j < 16; j++)
+                        {
+                            if (ptr[j] == 0x24 && ptr[j + 1] == off)
+                            {
+                                ptr[j + 1] = off - 8;
+                                break;
+                            }
+                        }
+                    }
+                    // else if disp < -0x80 or too small, skip
+                }
             }
         }
-        
-        // Restore protection
-        mprotect((void*)page_start, 4096, PROT_READ | PROT_EXEC);
+
+        // 4b. Replace syscall/sysenter with call *%rax
+        if (ci->id == X86_INS_SYSCALL || ci->id == X86_INS_SYSENTER)
+        {
+            if (ptr != (uint8_t *)(uintptr_t)syscall_addr)
+            {
+                ptr[0] = 0xFF; // opcode for CALL r/m64
+                ptr[1] = 0xD0; // modrm: rax
+            }
+        }
     }
-    
-    dlclose(libc);
+
+    // Free Capstone structures
+    cs_free(insn, count);
+cleanup:
+    cs_close(&handle);
+
+restore_prot:
+    // 5. Restore original protection
+    if (mprotect((void *)code, code_size, mem_prot) != 0)
+    {
+        perror("mprotect restore");
+    }
 }
+
+/* entry point for binary rewriting */
+static void rewrite_syscalls(void)
+{
+    FILE *fp;
+    /* get memory mapping information from procfs */
+    assert((fp = fopen("/proc/self/maps", "r")) != NULL);
+    {
+        char buf[4096];
+        while (fgets(buf, sizeof(buf), fp) != NULL)
+        {
+            /* we do not touch stack and vsyscall memory */
+            if (((strstr(buf, "[stack]\n") == NULL)/* && (strstr(buf, "[vsyscall]\n") == NULL)*/))
+            {
+                int i = 0;
+                char addr[65] = {0};
+                char *c = strtok(buf, " ");
+                while (c != NULL)
+                {
+                    switch (i)
+                    {
+                    case 0:
+                        strncpy(addr, c, sizeof(addr) - 1);
+                        break;
+                    case 1:
+                    {
+                        int mem_prot = 0;
+                        {
+                            size_t j;
+                            for (j = 0; j < strlen(c); j++)
+                            {
+                                if (c[j] == 'r')
+                                    mem_prot |= PROT_READ;
+                                if (c[j] == 'w')
+                                    mem_prot |= PROT_WRITE;
+                                if (c[j] == 'x')
+                                    mem_prot |= PROT_EXEC;
+                            }
+                        }
+                        /* rewrite code if the memory is executable */
+                        if (mem_prot & PROT_EXEC)
+                        {
+                            size_t k;
+                            for (k = 0; k < strlen(addr); k++)
+                            {
+                                if (addr[k] == '-')
+                                {
+                                    addr[k] = '\0';
+                                    break;
+                                }
+                            }
+                            {
+                                int64_t from, to;
+                                from = strtol(&addr[0], NULL, 16);
+                                if (from == 0)
+                                {
+                                    /*
+                                     * this is trampoline code.
+                                     * so skip it.
+                                     */
+                                    break;
+                                }
+                                to = strtol(&addr[k + 1], NULL, 16);
+                                disassemble_and_rewrite_capstone((uint8_t *)from,
+                                                                 (size_t)to - from,
+                                                                 mem_prot);
+                            }
+                        }
+                    }
+                    break;
+                    }
+                    if (i == 1)
+                        break;
+                    c = strtok(NULL, " ");
+                    i++;
+                }
+            }
+        }
+    }
+    fclose(fp);
+}
+// Find and replace syscall instructions
+// void rewrite_syscalls() {
+//     
+//     FILE *maps = fopen("/proc/self/maps", "r");
+//     if (!maps) {
+//         fprintf(stderr, "Failed to open /proc/self/maps\n");
+//         exit(1);
+//     }
+//     
+//     char line[1024];
+//     while (fgets(line, sizeof(line), maps)) {
+//         // Skip special regions
+//         if (strstr(line, "[stack]") || strstr(line, "[vsyscall]") || 
+//             strstr(line, "[vdso]")) {
+//             continue;
+//         }
+//         
+//         // Parse address range and permissions
+//         uintptr_t start, end;
+//         char perms[5] = {0};
+//         if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) {
+//             continue;
+//         }
+//         
+//         // Only process executable regions
+//         if (strchr(perms, 'x') == NULL) {
+//             continue;
+//         }
+//         
+//         // Skip regions at address 0 (our trampoline)
+//         if (start < 0x1000) {
+//             continue;
+//         }
+//         
+//         // Make the region writable
+//         int orig_prot = 0;
+//         if (strchr(perms, 'r')) orig_prot |= PROT_READ;
+//         if (strchr(perms, 'w')) orig_prot |= PROT_WRITE;
+//         if (strchr(perms, 'x')) orig_prot |= PROT_EXEC;
+//         
+//         if (mprotect((void*)start, end - start, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+//             perror("mprotect error");
+//             return;
+//         }
+//         
+//         for (uintptr_t addr = start; addr < end - 1; addr++) {
+//             unsigned char *ptr = (unsigned char*)addr;
+// 
+//             // Skip syscall instruction in trigger_syscall
+//             if ((uintptr_t)ptr == (uintptr_t)syscall_addr) {
+//                 continue;
+//             }
+// 
+//             if (ptr[0] == 0x0F && ptr[1] == 0x05) {  // syscall
+//                 ptr[0] = 0xff;  // call
+//                 ptr[1] = 0xd0;  // *%rax
+//             }
+//         }
+//         
+//         // Restore original permissions
+//         mprotect((void*)start, end - start, orig_prot);
+//     }
+//     
+//     fclose(maps);
+// }
+
 
 // Function to load the hook library
 static void load_hook_lib(void) {
@@ -358,22 +583,8 @@ static void load_hook_lib(void) {
 // Library constructor
 __attribute__((constructor))
 void init() {
-    // DEBUG("libzpoline.so initializing");
 
-    // Check if running under Python
-    char proc_name[256] = {0};
-    int len = readlink("/proc/self/exe", proc_name, sizeof(proc_name)-1);
-    if (len > 0) {
-        proc_name[len] = '\0';
-        if (strstr(proc_name, "python")) {
-            // Use selective approach for Python
-            setup_trampoline();
-            selective_rewrite();
-            load_hook_lib();
-            return;
-        }
-    }
-    
+    DEBUG("libzpoline.so initializing");
     // Check mmap_min_addr
     FILE *f = fopen("/proc/sys/vm/mmap_min_addr", "r");
     if (f) {
@@ -391,12 +602,20 @@ void init() {
     // Set up trampoline
     setup_trampoline();
 
-    // DEBUG("finish setup trampoline");
+    DEBUG("finish setup trampoline");
+
+    
     // Rewrite syscalls with call *%rax
     rewrite_syscalls();
     
-    // DEBUG("finish rewrite syscalls");
+    DEBUG("finish rewrite syscalls");
     // Load hook library if specified
     load_hook_lib();
+    
+    
+    if (getenv("ZDEBUG")) {
+        asm("int3");  // Breakpoint for debugging
+    }
+    
 
 }

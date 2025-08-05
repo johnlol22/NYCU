@@ -53,8 +53,8 @@ static void print_escaped_buffer(const char *buffer, int64_t length, int64_t max
 
 // Handle openat syscall
 static void log_openat(int64_t dirfd, const char *pathname, int64_t flags, int64_t mode, int64_t ret) {
-    // int pid=getpid();
-    fprintf(stderr, "[logger] openat(");
+    int pid=getpid();
+    fprintf(stderr, "[logger] [%d] openat(", pid);
     
     // AT_FDCWD is -100, but it might be passed as an unsigned value
     // Convert to signed for comparison
@@ -71,8 +71,8 @@ static void log_openat(int64_t dirfd, const char *pathname, int64_t flags, int64
 
 // Handle read syscall
 static void log_read(int64_t fd, const char *buf, int64_t count, int64_t ret) {
-    // int pid=getpid();
-    fprintf(stderr, "[logger] read(%ld, ", fd);
+    int pid=getpid();
+    fprintf(stderr, "[logger] [%d] read(%ld, ", pid, fd);
     
     if (ret >= 0) {
         // Only print content if read was successful
@@ -86,8 +86,8 @@ static void log_read(int64_t fd, const char *buf, int64_t count, int64_t ret) {
 
 // Handle write syscall
 static void log_write(int64_t fd, const char *buf, int64_t count, int64_t ret) {
-    //int pid=getpid();
-    fprintf(stderr, "[logger] write(%ld, ", fd);
+    int pid=getpid();
+    fprintf(stderr, "[logger] [%d] write(%ld, ", pid, fd);
     
     if (count > 0) {
         print_escaped_buffer(buf, count, 32);
@@ -100,8 +100,8 @@ static void log_write(int64_t fd, const char *buf, int64_t count, int64_t ret) {
 
 // Handle connect syscall
 static void log_connect(int64_t sockfd, const struct sockaddr *addr, int64_t addrlen, int64_t ret) {
-    //int pid=getpid();
-    fprintf(stderr, "[logger] connect(%ld, ", sockfd);
+    int pid=getpid();
+    fprintf(stderr, "[logger] [%d] connect(%ld, ", pid, sockfd);
     
     if (addr->sa_family == AF_INET) {
         // IPv4 address
@@ -140,8 +140,8 @@ static void log_connect(int64_t sockfd, const struct sockaddr *addr, int64_t add
 
 // Handle execve syscall
 static void log_execve(const char *pathname, void *argv, void *envp) {
-    //int pid=getpid();
-    fprintf(stderr, "[logger] execve(\"%s\", %p, %p)\n", pathname, argv, envp);
+    int pid=getpid();
+    fprintf(stderr, "[logger] [%d] execve(\"%s\", %p, %p)\n", pid, pathname, argv, envp);
 }
 
 // Main syscall hook function
@@ -149,14 +149,14 @@ static int64_t syscall_hook_fn(int64_t rdi, int64_t rsi, int64_t rdx,
                               int64_t r10, int64_t r8, int64_t r9,
                               int64_t rax) {
     int64_t ret;
-    
+    // fprintf(stderr, "syscall number %ld\n", rax);
     // Handle execve specially - log before the call
     if (rax == SYS_execve) {
         log_execve((const char *)rdi, (void *)rsi, (void *)rdx);
     }
     
     // Call the original syscall - using the same parameter order
-    ret = original_syscall(rax, rdi, rsi, rdx, r10, r8, r9);
+    ret = original_syscall(rdi, rsi, rdx, r10, r8, r9, rax);
     
     // Log based on syscall number
     switch (rax) {

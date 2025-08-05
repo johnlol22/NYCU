@@ -33,16 +33,20 @@ void init() {
         0                        // No offset
     );
 
+    
     if (addr != (void *)0) {
         fprintf(stderr, "Failed to map memory at address 0\n");
         exit(1);
     }
-
-    // Fill the first 512 bytes with NOP instructions
-    memset(addr, NOP, 512);
+    
+    unsigned char *mem_ptr = (unsigned char *)(uintptr_t)addr;
+    
+    for (int i = 0; i < 512; i++) {
+        mem_ptr[i] = NOP;
+    }
 
     // At position 512, we'll place the code for our trampoline
-    unsigned char *trampoline = (unsigned char *)addr + 512;
+    unsigned char *trampoline = mem_ptr + 512;
 
     // We'll place a simple call to our trampoline_handler function
     // This is a simplified approach - in practice, you'd need to write
